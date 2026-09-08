@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 
-interface Shot {
+interface ScriptShot {
   time: string;
   visual: string;
   voiceover: string;
@@ -23,68 +23,133 @@ interface Shot {
 interface ScriptResponse {
   hook: string;
   callToAction: string;
-  shots: Shot[];
+  shots: ScriptShot[];
+}
+
+interface StoredShot {
+  id: string;
+  shot_index: number;
+  time_marker: string;
+  visual_cue: string;
+  voiceover: string;
+  media_url: string | null;
+}
+
+const SHOT_LABELS = ["Shot 1: 0-3s", "Shot 2: 3-7s", "Shot 3: 7-12s"] as const;
+
+function parseDishAndAudience(prompt: string): {
+  dish_concept: string;
+  target_audience: string;
+} {
+  const match = prompt.match(/target audience:\s*(.+)$/is);
+  if (match && match.index !== undefined) {
+    const target_audience = match[1].trim().replace(/[.\s]+$/, "");
+    const dish_concept = prompt
+      .slice(0, match.index)
+      .replace(/signature dish:\s*/i, "")
+      .trim()
+      .replace(/[.\s]+$/, "");
+    return {
+      dish_concept: dish_concept || prompt.trim(),
+      target_audience: target_audience || "General",
+    };
+  }
+  return { dish_concept: prompt.trim(), target_audience: "General" };
 }
 
 export default function Home() {
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const shotInputRefs = useRef<(HTMLInputElement | null)[]>([]);
   const [prompt, setPrompt] = useState(
     "Signature Dish: Truffle Wagyu Smash Burger with caramelized onions and smoked cheddar. Target audience: Foodies in London."
   );
   const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
   const [data, setData] = useState<ScriptResponse | null>(null);
   const [copied, setCopied] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [shots, setShots] = useState<StoredShot[]>([]);
+  const [previewByShot, setPreviewByShot] = useState<Record<number, string>>({});
+  const [uploadingByIndex, setUploadingByIndex] = useState<Record<number, boolean>>(
+    {}
+  );
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
 
-  const uploadVideo = useCallback(async (file: File) => {
-    if (!file.type.startsWith("video/")) {
-      alert("Please upload a video file.");
-      return;
-    }
-
-    setUploading(true);
-    const localUrl = URL.createObjectURL(file);
-    setPreviewUrl((prev) => {
-      if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
-      return localUrl;
+  const revokePreviews = useCallback((urls: Record<number, string>) => {
+    Object.values(urls).forEach((url) => {
+      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
     });
-
-    try {
-      const ext = file.name.split(".").pop() || "mp4";
-      const path = `${Date.now()}-${crypto.randomUUID()}.${ext}`;
-      const { error } = await supabase.storage
-        .from("raw-footage")
-        .upload(path, file, { contentType: file.type, upsert: false });
-
-      if (error) {
-        alert(error.message || "Upload failed");
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Upload failed";
-      alert(message);
-    } finally {
-      setUploading(false);
-    }
   }, []);
 
-  function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) void uploadVideo(file);
-    event.target.value = "";
-  }
+  const uploadShotVideo = useCallback(
+    async (file: File, shot: StoredShot) => {
+      if (!currentProjectId) {
+        alert("Generate a script first so the project can be saved.");
+        return;
+      }
+      if (!file.type.startsWith("video/")) {
+        alert("Please upload a video file.");
+        return;
+      }
 
-  function handleDrop(event: React.DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setIsDragging(false);
-    const file = event.dataTransfer.files?.[0];
-    if (file) void uploadVideo(file);
-  }
+      const idx = shot.shot_index;
+      const localUrl = URL.createObjectURL(file);
+      setPreviewByShot((prev) => {
+        const existing = prev[idx];
+        if (existing?.startsWith("blob:")) URL.revokeObjectURL(existing);
+        return { ...prev, [idx]: localUrl };
+      });
+      setUploadingByIndex((prev) => ({ ...prev, [idx]: true }));
+
+      try {
+        const ext = file.name.split(".").pop() || "mp4";
+        const path = `projects/${currentProjectId}/shot-${idx}.${ext}`;
+        const { error: uploadError } = await supabase.storage
+          .from("raw-footage")
+          .upload(path, file, { contentType: file.type, upsert: true });
+
+        if (uploadError) {
+          alert(uploadError.message || "Upload failed");
+          return;
+        }
+
+        const { data: publicData } = supabase.storage
+          .from("raw-footage")
+          .getPublicUrl(path);
+        const mediaUrl = publicData.publicUrl;
+
+        const { error: updateError } = await supabase
+          .from("project_shots")
+          .update({ media_url: mediaUrl })
+          .eq("id", shot.id);
+
+        if (updateError) {
+          alert(updateError.message || "Could not save shot media URL");
+          return;
+        }
+
+        setShots((prev) =>
+          prev.map((row) =>
+            row.id === shot.id ? { ...row, media_url: mediaUrl } : row
+          )
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Upload failed";
+        alert(message);
+      } finally {
+        setUploadingByIndex((prev) => ({ ...prev, [idx]: false }));
+      }
+    },
+    [currentProjectId]
+  );
 
   async function handleGenerate() {
     setLoading(true);
     setData(null);
+    setCurrentProjectId(null);
+    setShots([]);
+    setPreviewByShot((prev) => {
+      revokePreviews(prev);
+      return {};
+    });
 
     try {
       const res = await fetch("/api/chat", {
@@ -94,11 +159,52 @@ export default function Home() {
       });
 
       const json = await res.json();
-      if (res.ok) {
-        setData(json);
-      } else {
+      if (!res.ok) {
         alert(json.error || "Generation failed");
+        return;
       }
+
+      setData(json);
+
+      const { dish_concept, target_audience } = parseDishAndAudience(prompt);
+      const { data: project, error: projectError } = await supabase
+        .from("projects")
+        .insert({
+          dish_concept,
+          target_audience,
+          hook: json.hook,
+          call_to_action: json.callToAction,
+          status: "draft",
+        })
+        .select("id")
+        .single();
+
+      if (projectError || !project) {
+        alert(projectError?.message || "Could not save project");
+        return;
+      }
+
+      const shotRows = (json.shots as ScriptShot[]).slice(0, 3).map((shot, idx) => ({
+        project_id: project.id,
+        shot_index: idx,
+        time_marker: shot.time,
+        visual_cue: shot.visual,
+        voiceover: shot.voiceover,
+      }));
+
+      const { data: insertedShots, error: shotsError } = await supabase
+        .from("project_shots")
+        .insert(shotRows)
+        .select("id, shot_index, time_marker, visual_cue, voiceover, media_url")
+        .order("shot_index", { ascending: true });
+
+      if (shotsError || !insertedShots) {
+        alert(shotsError?.message || "Could not save storyboard shots");
+        return;
+      }
+
+      setCurrentProjectId(project.id);
+      setShots(insertedShots as StoredShot[]);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong";
       alert(message);
@@ -140,77 +246,29 @@ export default function Home() {
             </div>
           </div>
           <span className="text-xs px-2.5 py-1 rounded-full bg-zinc-900 border border-zinc-700 text-zinc-300">
-            Next.js + Claude 3.5
+            Day 2 · Projects
           </span>
         </div>
 
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,240px)_1fr]">
-          <div
-            onDragOver={(event) => {
-              event.preventDefault();
-              setIsDragging(true);
-            }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`relative mx-auto w-full max-w-[240px] aspect-[9/16] rounded-xl border-2 border-dashed cursor-pointer overflow-hidden transition ${
-              isDragging
-                ? "border-emerald-400 bg-emerald-500/10"
-                : "border-zinc-700 bg-zinc-900/60 hover:border-zinc-500"
-            }`}
+        <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-6 space-y-4">
+          <label className="text-sm font-medium text-zinc-300">
+            Dish Concept & Target Audience
+          </label>
+          <textarea
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            rows={5}
+            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm focus:outline-none focus:border-zinc-500 resize-none"
+            placeholder="Describe the dish, ingredients, and style..."
+          />
+          <button
+            onClick={() => void handleGenerate()}
+            disabled={loading || !prompt.trim()}
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-white text-zinc-950 hover:bg-zinc-200 font-semibold px-5 py-2.5 rounded-lg text-sm transition disabled:opacity-50"
           >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/*"
-              className="hidden"
-              onChange={handleFileChange}
-            />
-
-            {previewUrl ? (
-              <video
-                src={previewUrl}
-                className="absolute inset-0 h-full w-full object-cover"
-                controls
-                playsInline
-                muted
-              />
-            ) : (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center">
-                <Upload className="w-8 h-8 text-zinc-400" />
-                <p className="text-sm font-medium text-zinc-200">Drop raw footage</p>
-                <p className="text-xs text-zinc-500">9:16 preview · raw-footage bucket</p>
-              </div>
-            )}
-
-            {uploading && (
-              <div className="absolute inset-0 bg-zinc-950/70 flex flex-col items-center justify-center gap-2">
-                <Loader2 className="w-6 h-6 animate-spin text-emerald-400" />
-                <span className="text-xs text-zinc-300">Uploading...</span>
-              </div>
-            )}
-          </div>
-
-          <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-6 space-y-4">
-            <label className="text-sm font-medium text-zinc-300">
-              Dish Concept & Target Audience
-            </label>
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              rows={5}
-              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm focus:outline-none focus:border-zinc-500 resize-none"
-              placeholder="Describe the dish, ingredients, and style..."
-            />
-            <button
-              onClick={handleGenerate}
-              disabled={loading || !prompt.trim()}
-              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-white text-zinc-950 hover:bg-zinc-200 font-semibold px-5 py-2.5 rounded-lg text-sm transition disabled:opacity-50"
-            >
-              <Sparkles className="w-4 h-4" />
-              {loading ? "Generating Storyboard..." : "Generate 15s Script"}
-            </button>
-          </div>
+            <Sparkles className="w-4 h-4" />
+            {loading ? "Generating Storyboard..." : "Generate 15s Script"}
+          </button>
         </div>
 
         {data && (
@@ -223,6 +281,11 @@ export default function Home() {
                 <h2 className="text-2xl font-black tracking-tight mt-1 text-white">
                   &ldquo;{data.hook}&rdquo;
                 </h2>
+                {currentProjectId && (
+                  <p className="mt-2 text-xs font-mono text-zinc-500">
+                    Project {currentProjectId}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
@@ -242,26 +305,112 @@ export default function Home() {
               <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
                 Storyboard Shots
               </h3>
-              <div className="grid gap-3">
-                {data.shots.map((shot, idx) => (
-                  <div
-                    key={`${shot.time}-${idx}`}
-                    className="p-4 bg-zinc-950/70 border border-zinc-800/80 rounded-lg space-y-2"
-                  >
-                    <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
-                      <Clock className="w-3.5 h-3.5 text-zinc-500" />
-                      <span>{shot.time}</span>
+              <div className="grid gap-4 md:grid-cols-3">
+                {(shots.length > 0 ? shots : data.shots.map((shot, idx) => ({
+                  id: `local-${idx}`,
+                  shot_index: idx,
+                  time_marker: shot.time,
+                  visual_cue: shot.visual,
+                  voiceover: shot.voiceover,
+                  media_url: null,
+                }))).map((shot) => {
+                  const idx = shot.shot_index;
+                  const preview = previewByShot[idx] || shot.media_url;
+                  const uploading = Boolean(uploadingByIndex[idx]);
+                  const canUpload = Boolean(currentProjectId && shot.id && !shot.id.startsWith("local-"));
+
+                  return (
+                    <div
+                      key={shot.id}
+                      className="p-4 bg-zinc-950/70 border border-zinc-800/80 rounded-xl space-y-3"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-emerald-400">
+                          {SHOT_LABELS[idx] ?? `Shot ${idx + 1}`}
+                        </span>
+                        <span className="inline-flex items-center gap-1 text-[11px] font-mono text-zinc-500">
+                          <Clock className="w-3 h-3" />
+                          {shot.time_marker}
+                        </span>
+                      </div>
+
+                      <div
+                        onDragOver={(event) => {
+                          event.preventDefault();
+                          if (canUpload) setDraggingIndex(idx);
+                        }}
+                        onDragLeave={() => setDraggingIndex(null)}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          setDraggingIndex(null);
+                          const file = event.dataTransfer.files?.[0];
+                          if (file && canUpload) void uploadShotVideo(file, shot);
+                        }}
+                        onClick={() => {
+                          if (canUpload) shotInputRefs.current[idx]?.click();
+                        }}
+                        className={`relative mx-auto w-full max-w-[180px] aspect-[9/16] rounded-lg border-2 border-dashed overflow-hidden transition ${
+                          canUpload ? "cursor-pointer" : "cursor-not-allowed opacity-70"
+                        } ${
+                          draggingIndex === idx
+                            ? "border-emerald-400 bg-emerald-500/10"
+                            : "border-zinc-700 bg-zinc-900/60 hover:border-zinc-500"
+                        }`}
+                      >
+                        <input
+                          ref={(el) => {
+                            shotInputRefs.current[idx] = el;
+                          }}
+                          type="file"
+                          accept="video/*"
+                          className="hidden"
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file && canUpload) void uploadShotVideo(file, shot);
+                            event.target.value = "";
+                          }}
+                        />
+
+                        {preview ? (
+                          <video
+                            src={preview}
+                            className="absolute inset-0 h-full w-full object-cover"
+                            controls
+                            playsInline
+                            muted
+                            onClick={(event) => event.stopPropagation()}
+                          />
+                        ) : (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-3 text-center">
+                            <Upload className="w-6 h-6 text-zinc-400" />
+                            <p className="text-xs font-medium text-zinc-200">
+                              Drop shot footage
+                            </p>
+                            <p className="text-[10px] text-zinc-500">
+                              9:16 · raw-footage
+                            </p>
+                          </div>
+                        )}
+
+                        {uploading && (
+                          <div className="absolute inset-0 bg-zinc-950/70 flex flex-col items-center justify-center gap-2">
+                            <Loader2 className="w-6 h-6 animate-spin text-emerald-400" />
+                            <span className="text-xs text-zinc-300">Uploading...</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-start gap-2 text-sm text-zinc-300">
+                        <Video className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
+                        <span>{shot.visual_cue}</span>
+                      </div>
+                      <div className="flex items-start gap-2 text-sm text-emerald-300">
+                        <Mic className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                        <span className="italic">&ldquo;{shot.voiceover}&rdquo;</span>
+                      </div>
                     </div>
-                    <div className="flex items-start gap-2 text-sm text-zinc-300">
-                      <Video className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
-                      <span>{shot.visual}</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-sm text-emerald-300">
-                      <Mic className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                      <span className="italic">&ldquo;{shot.voiceover}&rdquo;</span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
