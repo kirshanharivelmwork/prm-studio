@@ -13,6 +13,7 @@ import {
   Loader2,
   Play,
   Pause,
+  AudioLines,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 
@@ -35,6 +36,7 @@ interface StoredShot {
   visual_cue: string;
   voiceover: string;
   media_url: string | null;
+  voiceover_audio_url: string | null;
 }
 
 const SHOT_LABELS = ["Shot 1: 0-3s", "Shot 2: 3-7s", "Shot 3: 7-12s"] as const;
@@ -96,15 +98,21 @@ function SequencePlayer({
   shots,
   previewByShot,
   onActiveIndexChange,
+  onGenerateAllVoiceovers,
+  generatingAllVoiceovers,
 }: {
   hook: string;
   shots: StoredShot[];
   previewByShot: Record<number, string>;
   onActiveIndexChange: (index: number) => void;
+  onGenerateAllVoiceovers?: () => void;
+  generatingAllVoiceovers?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const voAudioRef = useRef<HTMLAudioElement>(null);
   const lastShotRef = useRef(0);
   const loadedShotRef = useRef(-1);
+  const loadedVoShotRef = useRef(-1);
 
   const [seqTime, setSeqTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -119,10 +127,60 @@ function SequencePlayer({
   const mediaUrl =
     previewByShot[windowAtTime.index] || activeShot?.media_url || null;
 
+  const syncVoiceover = useCallback(
+    (time: number, shouldPlay: boolean) => {
+      const { index, localTime } = shotWindow(time);
+      const url = shots[index]?.voiceover_audio_url || null;
+      const audio = voAudioRef.current;
+      if (!audio) return;
+
+      if (!url) {
+        audio.pause();
+        loadedVoShotRef.current = index;
+        audio.removeAttribute("src");
+        audio.load();
+        return;
+      }
+
+      const needsLoad =
+        loadedVoShotRef.current !== index || audio.getAttribute("data-src") !== url;
+
+      if (needsLoad) {
+        loadedVoShotRef.current = index;
+        audio.setAttribute("data-src", url);
+        audio.src = url;
+        const apply = () => {
+          try {
+            audio.currentTime = Math.min(localTime, audio.duration || localTime);
+          } catch {
+            /* ignore */
+          }
+        };
+        audio.addEventListener("loadedmetadata", apply, { once: true });
+        apply();
+        if (shouldPlay) void audio.play().catch(() => undefined);
+        else audio.pause();
+        return;
+      }
+
+      if (Math.abs(audio.currentTime - localTime) > 0.3) {
+        try {
+          audio.currentTime = Math.min(localTime, audio.duration || localTime);
+        } catch {
+          /* ignore */
+        }
+      }
+      if (shouldPlay) void audio.play().catch(() => undefined);
+      else audio.pause();
+    },
+    [shots]
+  );
+
   const syncMedia = useCallback(
     (time: number, shouldPlay: boolean) => {
       const { index, localTime } = shotWindow(time);
       onActiveIndexChange(index);
+      syncVoiceover(time, shouldPlay);
 
       const url = previewByShot[index] || shots[index]?.media_url || null;
       const video = videoRef.current;
@@ -164,7 +222,7 @@ function SequencePlayer({
       if (shouldPlay) void video.play().catch(() => undefined);
       else video.pause();
     },
-    [onActiveIndexChange, previewByShot, shots]
+    [onActiveIndexChange, previewByShot, shots, syncVoiceover]
   );
 
   const syncMediaRef = useRef(syncMedia);
@@ -223,6 +281,7 @@ function SequencePlayer({
     if (isPlaying) {
       setIsPlaying(false);
       videoRef.current?.pause();
+      voAudioRef.current?.pause();
       return;
     }
     playFrom(seqTime >= SEQUENCE_TOTAL ? 0 : seqTime);
@@ -283,6 +342,8 @@ function SequencePlayer({
 
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/20 via-transparent to-black/55" />
 
+        <audio ref={voAudioRef} className="hidden" preload="auto" />
+
         <div className="pointer-events-none absolute inset-x-0 top-[54%] px-3">
           <p
             className="text-center text-[1.35rem] font-black uppercase leading-[1.05] tracking-tight text-white"
@@ -306,18 +367,35 @@ function SequencePlayer({
             <Play className="w-3.5 h-3.5 fill-current" />
             Play Full Sequence
           </button>
-          <button
-            type="button"
-            onClick={handlePlayPause}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-950 text-zinc-100 hover:border-zinc-500 transition"
-            aria-label={isPlaying ? "Pause" : "Play"}
-          >
+          <div className="flex items-center gap-1.5">
+            {onGenerateAllVoiceovers && (
+              <button
+                type="button"
+                onClick={onGenerateAllVoiceovers}
+                disabled={generatingAllVoiceovers}
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-[11px] font-medium text-zinc-100 hover:border-zinc-500 transition disabled:opacity-50"
+              >
+                {generatingAllVoiceovers ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                ) : (
+                  <AudioLines className="w-3.5 h-3.5 text-emerald-400" />
+                )}
+                All VO
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handlePlayPause}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-950 text-zinc-100 hover:border-zinc-500 transition"
+              aria-label={isPlaying ? "Pause" : "Play"}
+            >
             {isPlaying ? (
               <Pause className="w-3.5 h-3.5" />
             ) : (
               <Play className="w-3.5 h-3.5" />
             )}
-          </button>
+            </button>
+          </div>
         </div>
 
         <p
@@ -378,6 +456,10 @@ export default function Home() {
   );
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [activeSeqShot, setActiveSeqShot] = useState(0);
+  const [voGeneratingByIndex, setVoGeneratingByIndex] = useState<
+    Record<number, boolean>
+  >({});
+  const [generatingAllVoiceovers, setGeneratingAllVoiceovers] = useState(false);
 
   const revokePreviews = useCallback((urls: Record<number, string>) => {
     Object.values(urls).forEach((url) => {
@@ -395,6 +477,7 @@ export default function Home() {
       visual_cue: shot.visual,
       voiceover: shot.voiceover,
       media_url: null,
+      voiceover_audio_url: null,
     }));
   }, [data, shots]);
 
@@ -460,12 +543,83 @@ export default function Home() {
     [currentProjectId]
   );
 
+  const generateVoiceover = useCallback(async (shot: StoredShot) => {
+    if (!shot.voiceover.trim()) {
+      alert("This shot has no voiceover text.");
+      return;
+    }
+    if (!shot.id || shot.id.startsWith("local-")) {
+      alert("Generate a script first so the shot can be saved.");
+      return;
+    }
+
+    const idx = shot.shot_index;
+    setVoGeneratingByIndex((prev) => ({ ...prev, [idx]: true }));
+
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: shot.voiceover }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.audioUrl) {
+        alert(json.error || "Voiceover generation failed");
+        return;
+      }
+
+      const { error: updateError } = await supabase
+        .from("project_shots")
+        .update({ voiceover_audio_url: json.audioUrl })
+        .eq("id", shot.id);
+
+      if (updateError) {
+        alert(updateError.message || "Could not save voiceover URL");
+        return;
+      }
+
+      setShots((prev) =>
+        prev.map((row) =>
+          row.id === shot.id
+            ? { ...row, voiceover_audio_url: json.audioUrl as string }
+            : row
+        )
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Voiceover failed";
+      alert(message);
+    } finally {
+      setVoGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
+    }
+  }, []);
+
+  const generateAllVoiceovers = useCallback(async () => {
+    const targets = (shots.length > 0 ? shots : []).filter(
+      (shot) => shot.id && !shot.id.startsWith("local-") && shot.voiceover.trim()
+    );
+    if (targets.length === 0) {
+      alert("Generate a script first so shots can be saved.");
+      return;
+    }
+
+    setGeneratingAllVoiceovers(true);
+    try {
+      for (const shot of targets) {
+        await generateVoiceover(shot);
+      }
+    } finally {
+      setGeneratingAllVoiceovers(false);
+    }
+  }, [generateVoiceover, shots]);
+
   async function handleGenerate() {
     setLoading(true);
     setData(null);
     setCurrentProjectId(null);
     setShots([]);
     setActiveSeqShot(0);
+    setVoGeneratingByIndex({});
+    setGeneratingAllVoiceovers(false);
     setPreviewByShot((prev) => {
       revokePreviews(prev);
       return {};
@@ -515,7 +669,9 @@ export default function Home() {
       const { data: insertedShots, error: shotsError } = await supabase
         .from("project_shots")
         .insert(shotRows)
-        .select("id, shot_index, time_marker, visual_cue, voiceover, media_url")
+        .select(
+          "id, shot_index, time_marker, visual_cue, voiceover, media_url, voiceover_audio_url"
+        )
         .order("shot_index", { ascending: true });
 
       if (shotsError || !insertedShots) {
@@ -628,12 +784,31 @@ export default function Home() {
                 shots={displayShots}
                 previewByShot={previewByShot}
                 onActiveIndexChange={setActiveSeqShot}
+                onGenerateAllVoiceovers={() => void generateAllVoiceovers()}
+                generatingAllVoiceovers={generatingAllVoiceovers}
               />
 
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                  Storyboard Shots
-                </h3>
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                    Storyboard Shots
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => void generateAllVoiceovers()}
+                    disabled={generatingAllVoiceovers}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition disabled:opacity-50"
+                  >
+                    {generatingAllVoiceovers ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <AudioLines className="w-3.5 h-3.5" />
+                    )}
+                    {generatingAllVoiceovers
+                      ? "Generating Voiceovers..."
+                      : "Generate All Voiceovers"}
+                  </button>
+                </div>
                 <div className="grid gap-4 md:grid-cols-3">
                   {displayShots.map((shot) => {
                     const idx = shot.shot_index;
@@ -735,9 +910,33 @@ export default function Home() {
                           <Video className="w-4 h-4 text-sky-400 shrink-0 mt-0.5" />
                           <span>{shot.visual_cue}</span>
                         </div>
-                        <div className="flex items-start gap-2 text-sm text-emerald-300">
-                          <Mic className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                          <span className="italic">&ldquo;{shot.voiceover}&rdquo;</span>
+                        <div className="space-y-2">
+                          <div className="flex items-start gap-2 text-sm text-emerald-300">
+                            <Mic className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                            <span className="italic">&ldquo;{shot.voiceover}&rdquo;</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => void generateVoiceover(shot)}
+                            disabled={Boolean(voGeneratingByIndex[idx]) || generatingAllVoiceovers}
+                            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:border-emerald-500/40 hover:text-emerald-300 transition disabled:opacity-50"
+                          >
+                            {voGeneratingByIndex[idx] ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                            ) : (
+                              <AudioLines className="w-3.5 h-3.5 text-emerald-400" />
+                            )}
+                            {voGeneratingByIndex[idx]
+                              ? "Generating..."
+                              : "Generate Voiceover"}
+                          </button>
+                          {shot.voiceover_audio_url && (
+                            <audio
+                              src={shot.voiceover_audio_url}
+                              controls
+                              className="w-full h-8 accent-emerald-400"
+                            />
+                          )}
                         </div>
                       </div>
                     );
